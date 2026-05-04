@@ -43,7 +43,7 @@ def train(
     latest_ckpt = checkpoint_dir / "last_checkpoint.pth"
     if latest_ckpt.exists():
         print("🔄 Resume training from checkpoint...")
-        ckpt = torch.load(latest_ckpt)
+        ckpt = torch.load(latest_ckpt, weights_only=False)
         model.load_state_dict(ckpt["model"])
         start_epoch = ckpt["epoch"]
         best_val_auc = ckpt["best_val_auc"]
