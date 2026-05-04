@@ -8,7 +8,7 @@ INPUT_DIM = 224
 MAX_PIXEL_VAL = 255
 MEAN = 58.09
 STDDEV = 49.73
-TARGET_SLICES = 32   # FIX batch size
+TARGET_SLICES = 32
 
 
 def _normalize_id(raw_id):
@@ -33,23 +33,26 @@ def resize_slices(vol, target=TARGET_SLICES):
     return vol
 
 
-# ===== PREPROCESS =====
+# ===== PREPROCESS (FIX QUAN TRỌNG) =====
 def preprocess(vol):
     vol = vol.astype(np.float32)
 
     pad = int((vol.shape[2] - INPUT_DIM) / 2)
     vol = vol[:, pad:-pad, pad:-pad]
 
-    vol = (vol - np.min(vol)) / (np.max(vol) - np.min(vol) + 1e-6) * MAX_PIXEL_VAL
+    # normalize
+    vol = (vol - np.min(vol)) / (np.max(vol) - np.min(vol) + 1e-6)
+    vol = vol * MAX_PIXEL_VAL
     vol = (vol - MEAN) / STDDEV
 
-    # 🔥 chỉ lấy 1 slice
-    mid = vol.shape[0] // 2
-    vol = vol[mid]
+    # 🔥 FIX: dùng nhiều slice
+    vol = resize_slices(vol, TARGET_SLICES)
 
-    vol = np.stack((vol,) * 3, axis=0)
+    # convert thành (N, 3, H, W)
+    vol = np.stack((vol,) * 3, axis=1)
 
     return torch.FloatTensor(vol)
+
 
 class Dataset(data.Dataset):
     def __init__(self, datadir, tear_type, use_gpu, labels_dir=None, augment=False):
@@ -62,6 +65,7 @@ class Dataset(data.Dataset):
         label_dict = {}
         abnormal_dict = {}
 
+        # ===== LOAD LABEL =====
         for line in open(label_root + '-' + tear_type + '.csv'):
             fid, lab = line.strip().split(',')
             label_dict[_normalize_id(fid)] = int(lab)
@@ -70,6 +74,7 @@ class Dataset(data.Dataset):
             fid, lab = line.strip().split(',')
             abnormal_dict[_normalize_id(fid)] = int(lab)
 
+        # ===== LOAD FILE =====
         self.paths = []
         for f in os.listdir(os.path.join(datadir, "axial")):
             if f.endswith(".npy"):
@@ -79,12 +84,16 @@ class Dataset(data.Dataset):
 
         self.paths.sort()
 
+        if len(self.paths) == 0:
+            raise ValueError("❌ No valid data found")
+
         self.labels = [label_dict[_normalize_id(p)] for p in self.paths]
         self.abnormal_labels = [abnormal_dict[_normalize_id(p)] for p in self.paths]
 
         pos = np.mean(self.labels)
         self.weights = [pos, 1 - pos]
 
+    # ===== WEIGHTED LOSS =====
     def weighted_loss(self, pred, target):
         weights = torch.FloatTensor([self.weights[int(t[0])] for t in target])
         if self.use_gpu:
@@ -98,14 +107,17 @@ class Dataset(data.Dataset):
         vol_sagit = np.load(os.path.join(self.datadir, "sagittal", fname))
         vol_coron = np.load(os.path.join(self.datadir, "coronal", fname))
 
-        # ===== AUGMENT (FIX dtype luôn) =====
+        # ===== AUGMENT =====
         if self.augment:
             if np.random.rand() < 0.5:
                 vol_axial = vol_axial[:, :, ::-1]
 
             if np.random.rand() < 0.3:
                 vol_sagit = vol_sagit.astype(np.float32)
-                vol_sagit += np.random.normal(0, 0.01, vol_sagit.shape).astype(np.float32)
+                vol_sagit += np.random.normal(0, 0.01, vol_sagit.shape)
+
+            if np.random.rand() < 0.3:
+                vol_coron = np.rot90(vol_coron, k=1, axes=(1, 2))
 
         vol_axial = preprocess(vol_axial)
         vol_sagit = preprocess(vol_sagit)
@@ -141,14 +153,18 @@ def load_data(task="abnormal", use_gpu=False, data_dir="data", labels_dir=None, 
     # ===== BALANCE =====
     labels = np.array(train_ds.labels)
     class_count = np.bincount(labels)
-    weights = 1. / class_count
+    weights = 1. / (class_count + 1e-6)
     sample_weights = weights[labels]
 
-    sampler = data.WeightedRandomSampler(sample_weights, len(sample_weights))
+    sampler = data.WeightedRandomSampler(
+        sample_weights,
+        len(sample_weights),
+        replacement=True
+    )
 
     train_loader = data.DataLoader(
         train_ds,
-        batch_size=2,
+        batch_size=1,  # 🔥 bắt buộc
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=True
@@ -156,7 +172,7 @@ def load_data(task="abnormal", use_gpu=False, data_dir="data", labels_dir=None, 
 
     valid_loader = data.DataLoader(
         valid_ds,
-        batch_size=2,
+        batch_size=1,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True
