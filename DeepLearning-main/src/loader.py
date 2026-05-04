@@ -40,12 +40,14 @@ def preprocess(vol):
 
 
 class Dataset(data.Dataset):
-    def __init__(self, datadir, task, labels_dir):
+    def __init__(self, datadir, task, labels_root):
         self.datadir = datadir
 
-        # 🔥 FIX PATH LABEL
-        label_path = os.path.join(labels_dir, f"{task}.csv")
-        abnormal_path = os.path.join(labels_dir, "abnormal.csv")
+        split = os.path.basename(datadir)  # train / valid
+
+        # 🔥 FIX CSV PATH ĐÚNG FORMAT DATASET BẠN
+        label_path = os.path.join(labels_root, f"{split}-{task}.csv")
+        abnormal_path = os.path.join(labels_root, f"{split}-abnormal.csv")
 
         if not os.path.exists(label_path):
             raise FileNotFoundError(f"Missing {label_path}")
@@ -74,7 +76,6 @@ class Dataset(data.Dataset):
         self.labels = [label_dict[_normalize_id(p)] for p in self.paths]
 
         print(f"Loaded {len(self.paths)} samples from {datadir}")
-
         for i in range(min(3, len(self.paths))):
             print(self.paths[i], self.labels[i])
 
@@ -93,26 +94,21 @@ class Dataset(data.Dataset):
         return ax, sa, co, y
 
 
-def load_data(task="acl", data_dir="data", labels_dir="labels", num_workers=2):
+def load_data(task="acl", data_dir="data", labels_root="labels", num_workers=2):
 
     train_ds = Dataset(
         os.path.join(data_dir, "train"),
         task,
-        labels_dir=os.path.join(labels_dir, "train")
+        labels_root
     )
 
     valid_ds = Dataset(
         os.path.join(data_dir, "valid"),
         task,
-        labels_dir=os.path.join(labels_dir, "valid")
+        labels_root
     )
 
-    train_loader = data.DataLoader(
-        train_ds, batch_size=1, shuffle=True, num_workers=num_workers
-    )
-
-    valid_loader = data.DataLoader(
-        valid_ds, batch_size=1, shuffle=False, num_workers=num_workers
-    )
+    train_loader = data.DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=num_workers)
+    valid_loader = data.DataLoader(valid_ds, batch_size=1, shuffle=False, num_workers=num_workers)
 
     return train_loader, valid_loader
