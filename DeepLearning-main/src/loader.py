@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import torch
-import torch.nn.functional as F
 import torch.utils.data as data
 
 INPUT_DIM = 224
@@ -16,7 +15,7 @@ def _normalize_id(raw_id):
     return str(int(base)) if base.isdigit() else base
 
 
-# ===== FIX SLICE =====
+# ===== FIX SLICE (IMPROVED) =====
 def resize_slices(vol, target=TARGET_SLICES):
     current = vol.shape[0]
 
@@ -26,7 +25,8 @@ def resize_slices(vol, target=TARGET_SLICES):
 
     elif current < target:
         pad = target - current
-        vol = np.pad(vol, ((0, pad), (0, 0), (0, 0)), mode='constant')
+        last = vol[-1:]
+        vol = np.concatenate([vol, np.repeat(last, pad, axis=0)], axis=0)
 
     return vol
 
@@ -47,13 +47,10 @@ def preprocess(vol, augment=False):
     # fix slice
     vol = resize_slices(vol, TARGET_SLICES)
 
-    # 🔥 AUGMENT (NHANH)
+    # 🔥 AUGMENT (SAFE)
     if augment:
         if np.random.rand() < 0.5:
-            vol = vol[:, :, ::-1]
-
-        if np.random.rand() < 0.3:
-            vol += np.random.normal(0, 0.01, vol.shape)
+            vol = vol[:, :, ::-1]  # flip only
 
     # to 3 channel
     vol = np.stack((vol,) * 3, axis=1)
@@ -96,6 +93,8 @@ class Dataset(data.Dataset):
 
         self.labels = [label_dict[_normalize_id(p)] for p in self.paths]
 
+        print(f"✅ Loaded {len(self.paths)} samples")
+
     def __getitem__(self, idx):
         fname = self.paths[idx]
 
@@ -134,22 +133,12 @@ def load_data(task="acl", use_gpu=False, data_dir="data", labels_dir=None, num_w
         augment=False
     )
 
-    # 🔥 BALANCE SAMPLER
-    labels = np.array(train_ds.labels)
-    class_count = np.bincount(labels)
-    weights = 1. / (class_count + 1e-6)
-    sample_weights = weights[labels]
-
-    sampler = data.WeightedRandomSampler(
-        sample_weights,
-        len(sample_weights),
-        replacement=True
-    )
+    # ❌ REMOVE SAMPLER (CAUSE UNSTABLE TRAINING)
 
     train_loader = data.DataLoader(
         train_ds,
         batch_size=1,
-        sampler=sampler,
+        shuffle=True,
         num_workers=num_workers,
         pin_memory=True
     )
