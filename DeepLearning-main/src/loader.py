@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import torch
-import torch.nn.functional as F
 import torch.utils.data as data
 
 INPUT_DIM = 224
@@ -16,7 +15,6 @@ def _normalize_id(raw_id):
     return str(int(base)) if base.isdigit() else base
 
 
-# ===== FIX SLICE =====
 def resize_slices(vol, target=TARGET_SLICES):
     current = vol.shape[0]
 
@@ -31,26 +29,27 @@ def resize_slices(vol, target=TARGET_SLICES):
     return vol
 
 
-# ===== PREPROCESS =====
+# ================== PREPROCESS ==================
 def preprocess(vol):
     vol = vol.astype(np.float32)
 
+    # center crop
     pad = int((vol.shape[2] - INPUT_DIM) / 2)
     vol = vol[:, pad:-pad, pad:-pad]
 
+    # normalize
     vol = (vol - np.min(vol)) / (np.max(vol) - np.min(vol) + 1e-6)
     vol = vol * MAX_PIXEL_VAL
     vol = (vol - MEAN) / STDDEV
 
-    # ❗ giữ logic của bạn (1 slice)
+    # 🔥 FIX QUAN TRỌNG: lấy 3 slice thay vì 1
     mid = vol.shape[0] // 2
-    vol = vol[mid]
+    vol = vol[mid-1:mid+2]   # (3, H, W)
 
-    vol = np.stack((vol,) * 3, axis=0)
-
-    return torch.from_numpy(vol).float().unsqueeze(0)
+    return torch.from_numpy(vol).float()
 
 
+# ================== DATASET ==================
 class Dataset(data.Dataset):
     def __init__(self, datadir, tear_type, use_gpu, labels_dir=None, augment=False):
         self.use_gpu = use_gpu
@@ -109,8 +108,8 @@ class Dataset(data.Dataset):
         vol_sagit = preprocess(vol_sagit)
         vol_coron = preprocess(vol_coron)
 
-        # ✅ FIX SHAPE (QUAN TRỌNG)
-        label = torch.tensor(self.labels[idx], dtype=torch.float32).unsqueeze(0)
+        # ✅ FIX LABEL SHAPE CHUẨN
+        label = torch.tensor([self.labels[idx]], dtype=torch.float32)
 
         return vol_axial, vol_sagit, vol_coron, label, self.abnormal_labels[idx]
 
@@ -118,7 +117,7 @@ class Dataset(data.Dataset):
         return len(self.paths)
 
 
-# ===== LOAD DATA =====
+# ================== LOAD DATA ==================
 def load_data(task="acl", use_gpu=False, data_dir="data", labels_dir=None, num_workers=2):
 
     train_ds = Dataset(
@@ -137,7 +136,7 @@ def load_data(task="acl", use_gpu=False, data_dir="data", labels_dir=None, num_w
         augment=False
     )
 
-    # ===== BALANCE (FIX chia 0) =====
+    # ===== BALANCE =====
     labels = np.array(train_ds.labels)
     class_count = np.bincount(labels)
     weights = 1. / (class_count + 1e-6)
@@ -151,7 +150,7 @@ def load_data(task="acl", use_gpu=False, data_dir="data", labels_dir=None, num_w
 
     train_loader = data.DataLoader(
         train_ds,
-        batch_size=1,   # giữ ổn định shape
+        batch_size=1,
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=True
