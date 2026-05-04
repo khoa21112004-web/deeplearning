@@ -7,9 +7,9 @@ import torch
 from datetime import datetime
 from pathlib import Path
 
-from evaluate import run_model
-from loader import load_data
-from model import TripleMRNet
+from src.evaluate import run_model
+from src.loader import load_data
+from src.model import TripleMRNet
 
 
 # ================= FOCAL LOSS =================
