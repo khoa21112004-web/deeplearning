@@ -1,69 +1,74 @@
 import numpy as np
 import os
 import torch
+import torch.nn.functional as F
 import torch.utils.data as data
 
 INPUT_DIM = 224
-TARGET_SLICES = 32
+MAX_PIXEL_VAL = 255
 MEAN = 58.09
-STD = 49.73
+STDDEV = 49.73
+TARGET_SLICES = 32   # FIX batch size
 
 
-def _normalize_id(x):
-    return os.path.splitext(os.path.basename(str(x).strip()))[0]
+def _normalize_id(raw_id):
+    base = os.path.splitext(os.path.basename(str(raw_id).strip()))[0]
+    if base.isdigit():
+        return str(int(base))
+    return base
 
 
+# ===== FIX SLICE =====
 def resize_slices(vol, target=TARGET_SLICES):
-    S = vol.shape[0]
-    if S > target:
-        st = (S - target) // 2
-        vol = vol[st:st + target]
-    elif S < target:
-        pad = target - S
-        last = vol[-1:]
-        vol = np.concatenate([vol, np.repeat(last, pad, axis=0)], axis=0)
+    current = vol.shape[0]
+
+    if current > target:
+        start = (current - target) // 2
+        vol = vol[start:start + target]
+
+    elif current < target:
+        pad = target - current
+        vol = np.pad(vol, ((0, pad), (0, 0), (0, 0)), mode='constant')
+
     return vol
 
 
+# ===== PREPROCESS =====
 def preprocess(vol):
     vol = vol.astype(np.float32)
 
-    pad = (vol.shape[2] - INPUT_DIM) // 2
+    pad = int((vol.shape[2] - INPUT_DIM) / 2)
     vol = vol[:, pad:-pad, pad:-pad]
 
-    vol = (vol - MEAN) / STD
+    vol = (vol - np.min(vol)) / (np.max(vol) - np.min(vol) + 1e-6) * MAX_PIXEL_VAL
+    vol = (vol - MEAN) / STDDEV
 
-    vol = resize_slices(vol)
+    # 🔥 chỉ lấy 1 slice
+    mid = vol.shape[0] // 2
+    vol = vol[mid]
 
-    vol = np.stack([vol, vol, vol], axis=1)
-    return torch.from_numpy(vol).float()
+    vol = np.stack((vol,) * 3, axis=0)
 
+    return torch.FloatTensor(vol)
 
 class Dataset(data.Dataset):
-    def __init__(self, datadir, task, labels_root):
-        self.datadir = datadir
+    def __init__(self, datadir, tear_type, use_gpu, labels_dir=None, augment=False):
+        self.use_gpu = use_gpu
+        self.augment = augment
+        self.datadir = datadir.rstrip('/')
 
-        split = os.path.basename(datadir)  # train / valid
-
-        # 🔥 FIX CSV PATH ĐÚNG FORMAT DATASET BẠN
-        label_path = os.path.join(labels_root, f"{split}-{task}.csv")
-        abnormal_path = os.path.join(labels_root, f"{split}-abnormal.csv")
-
-        if not os.path.exists(label_path):
-            raise FileNotFoundError(f"Missing {label_path}")
+        label_root = labels_dir if labels_dir else datadir
 
         label_dict = {}
         abnormal_dict = {}
 
-        with open(label_path) as f:
-            for line in f:
-                k, v = line.strip().split(',')
-                label_dict[_normalize_id(k)] = int(v)
+        for line in open(label_root + '-' + tear_type + '.csv'):
+            fid, lab = line.strip().split(',')
+            label_dict[_normalize_id(fid)] = int(lab)
 
-        with open(abnormal_path) as f:
-            for line in f:
-                k, v = line.strip().split(',')
-                abnormal_dict[_normalize_id(k)] = int(v)
+        for line in open(label_root + '-abnormal.csv'):
+            fid, lab = line.strip().split(',')
+            abnormal_dict[_normalize_id(fid)] = int(lab)
 
         self.paths = []
         for f in os.listdir(os.path.join(datadir, "axial")):
@@ -73,42 +78,88 @@ class Dataset(data.Dataset):
                     self.paths.append(f)
 
         self.paths.sort()
-        self.labels = [label_dict[_normalize_id(p)] for p in self.paths]
 
-        print(f"Loaded {len(self.paths)} samples from {datadir}")
-        for i in range(min(3, len(self.paths))):
-            print(self.paths[i], self.labels[i])
+        self.labels = [label_dict[_normalize_id(p)] for p in self.paths]
+        self.abnormal_labels = [abnormal_dict[_normalize_id(p)] for p in self.paths]
+
+        pos = np.mean(self.labels)
+        self.weights = [pos, 1 - pos]
+
+    def weighted_loss(self, pred, target):
+        weights = torch.FloatTensor([self.weights[int(t[0])] for t in target])
+        if self.use_gpu:
+            weights = weights.cuda()
+        return F.binary_cross_entropy_with_logits(pred, target, weight=weights)
+
+    def __getitem__(self, idx):
+        fname = self.paths[idx]
+
+        vol_axial = np.load(os.path.join(self.datadir, "axial", fname))
+        vol_sagit = np.load(os.path.join(self.datadir, "sagittal", fname))
+        vol_coron = np.load(os.path.join(self.datadir, "coronal", fname))
+
+        # ===== AUGMENT (FIX dtype luôn) =====
+        if self.augment:
+            if np.random.rand() < 0.5:
+                vol_axial = vol_axial[:, :, ::-1]
+
+            if np.random.rand() < 0.3:
+                vol_sagit = vol_sagit.astype(np.float32)
+                vol_sagit += np.random.normal(0, 0.01, vol_sagit.shape).astype(np.float32)
+
+        vol_axial = preprocess(vol_axial)
+        vol_sagit = preprocess(vol_sagit)
+        vol_coron = preprocess(vol_coron)
+
+        label = torch.FloatTensor([self.labels[idx]])
+
+        return vol_axial, vol_sagit, vol_coron, label, self.abnormal_labels[idx]
 
     def __len__(self):
         return len(self.paths)
 
-    def __getitem__(self, i):
-        f = self.paths[i]
 
-        ax = preprocess(np.load(os.path.join(self.datadir, "axial", f)))
-        sa = preprocess(np.load(os.path.join(self.datadir, "sagittal", f)))
-        co = preprocess(np.load(os.path.join(self.datadir, "coronal", f)))
-
-        y = torch.tensor([self.labels[i]], dtype=torch.float32)
-
-        return ax, sa, co, y
-
-
-def load_data(task="acl", data_dir="data", labels_root="labels", num_workers=2):
+# ===== LOAD DATA =====
+def load_data(task="abnormal", use_gpu=False, data_dir="data", labels_dir=None, num_workers=2):
 
     train_ds = Dataset(
         os.path.join(data_dir, "train"),
         task,
-        labels_root
+        use_gpu,
+        labels_dir=os.path.join(labels_dir, "train") if labels_dir else None,
+        augment=True
     )
 
     valid_ds = Dataset(
         os.path.join(data_dir, "valid"),
         task,
-        labels_root
+        use_gpu,
+        labels_dir=os.path.join(labels_dir, "valid") if labels_dir else None,
+        augment=False
     )
 
-    train_loader = data.DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=num_workers)
-    valid_loader = data.DataLoader(valid_ds, batch_size=1, shuffle=False, num_workers=num_workers)
+    # ===== BALANCE =====
+    labels = np.array(train_ds.labels)
+    class_count = np.bincount(labels)
+    weights = 1. / class_count
+    sample_weights = weights[labels]
+
+    sampler = data.WeightedRandomSampler(sample_weights, len(sample_weights))
+
+    train_loader = data.DataLoader(
+        train_ds,
+        batch_size=2,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+
+    valid_loader = data.DataLoader(
+        valid_ds,
+        batch_size=2,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
 
     return train_loader, valid_loader
