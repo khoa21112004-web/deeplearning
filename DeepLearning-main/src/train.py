@@ -65,49 +65,52 @@ def train(
 
     epoch = max_epoch
 
-    while epoch < epochs:
-        print(f"\n🚀 Epoch {epoch+1}/{epochs}")
+   while epoch < epochs:
+    print(f"\n🚀 Epoch {epoch+1}/{epochs}")
 
-      train_loss, train_auc, _, _ = run_model(
-          model, train_loader, train=True,
-          optimizer=optimizer,
-          use_amp=(use_gpu and use_amp),
-          scaler=scaler
-)
+    # ===== TRAIN =====
+    train_loss, train_auc, _, _ = run_model(
+        model,
+        train_loader,
+        train=True,
+        optimizer=optimizer,
+        use_amp=(use_gpu and use_amp),
+        scaler=scaler
+    )
 
-        print(f"Train Loss: {train_loss:.4f}")
-        print(f"Train AUC: {train_auc:.4f}")
+    print(f"Train Loss: {train_loss:.4f}")
+    print(f"Train AUC: {train_auc:.4f}")
 
-        val_loss, val_auc, _, _ = run_model(
-            model, valid_loader,
-            abnormal_model_path=abnormal_model_path,
-            use_amp=(use_gpu and use_amp)
-        )
+    # ===== VALID =====
+    val_loss, val_auc, _, _ = run_model(
+        model,
+        valid_loader,
+        use_amp=(use_gpu and use_amp)
+    )
 
-        print(f"Valid Loss: {val_loss:.4f}")
-        print(f"Valid AUC: {val_auc:.4f}")
+    print(f"Valid Loss: {val_loss:.4f}")
+    print(f"Valid AUC: {val_auc:.4f}")
 
-        scheduler.step(val_loss)
+    scheduler.step(val_loss)
 
-        # ===== SAVE BEST =====
-        if val_auc > best_val_auc:
-            best_val_auc = val_auc
-            counter = 0
+    # ===== SAVE BEST =====
+    if val_auc > best_val_auc:
+        best_val_auc = val_auc
+        counter = 0
 
-            save_path = checkpoint_dir / f"best_epoch{epoch+1}_auc{val_auc:.4f}.pth"
-            torch.save(model.state_dict(), save_path)
-            print("💾 Save BEST model")
+        save_path = checkpoint_dir / f"best_epoch{epoch+1}_auc{val_auc:.4f}.pth"
+        torch.save(model.state_dict(), save_path)
+        print("💾 Save BEST model")
+    else:
+        counter += 1
+        print(f"⚠ No improvement ({counter}/{patience})")
 
-        else:
-            counter += 1
-            print(f"⚠ No improvement ({counter}/{patience})")
+    # ===== EARLY STOP =====
+    if counter >= patience:
+        print("🛑 Early stopping triggered")
+        break
 
-        # ===== EARLY STOP =====
-        if counter >= patience:
-            print("🛑 Early stopping triggered")
-            break
-
-        epoch += 1
+    epoch += 1
 
 
 def get_parser():
