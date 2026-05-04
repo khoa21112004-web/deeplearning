@@ -19,6 +19,7 @@ def get_parser():
 
 def run_model(model, loader, train=False, optimizer=None,
         abnormal_model_path=None, use_amp=False, scaler=None):
+
     preds = []
     labels = []
     device = next(model.parameters()).device
@@ -40,63 +41,55 @@ def run_model(model, loader, train=False, optimizer=None,
     for batch in tqdm(loader):
         vol_axial, vol_sagit, vol_coron, label, abnormal = batch
         abnormal_flag = bool(abnormal.item()) if torch.is_tensor(abnormal) else bool(abnormal)
-        
+
         if train:
             if abnormal_model_path and not abnormal_flag:
                 continue
             optimizer.zero_grad()
 
-        if loader.dataset.use_gpu:
-            vol_axial = vol_axial.cuda(non_blocking=True)
-            vol_sagit = vol_sagit.cuda(non_blocking=True)
-            vol_coron = vol_coron.cuda(non_blocking=True)
-            label = label.cuda(non_blocking=True)
-        vol_axial, vol_sagit, vol_coron = Variable(vol_axial), Variable(vol_sagit), Variable(vol_coron)
-        label = Variable(label)
+        # ===== 🔥 FIX GPU =====
+        vol_axial = vol_axial.to(device, non_blocking=True)
+        vol_sagit = vol_sagit.to(device, non_blocking=True)
+        vol_coron = vol_coron.to(device, non_blocking=True)
+        label = label.to(device, non_blocking=True)
 
         with torch.set_grad_enabled(train):
-            if use_amp:
-                with torch.cuda.amp.autocast():
-                    logit = model(vol_axial, vol_sagit, vol_coron)
-                    loss = loader.dataset.weighted_loss(logit, label)
-            else:
+            with torch.amp.autocast("cuda", enabled=use_amp):
+
                 logit = model(vol_axial, vol_sagit, vol_coron)
                 loss = loader.dataset.weighted_loss(logit, label)
+
         total_loss += loss.item()
 
         pred = torch.sigmoid(logit)
-
-        pred_npy = pred.data.cpu().numpy()[0][0]
+        pred_npy = pred.detach().cpu().numpy()[0][0]
 
         if abnormal_model_path and not train:
             with torch.no_grad():
                 abnormal_logit = abnormal_model(vol_axial, vol_sagit, vol_coron)
             abnormal_pred = torch.sigmoid(abnormal_logit)
-            abnormal_pred_npy = abnormal_pred.data.cpu().numpy()[0][0]
-            pred_npy = pred_npy * abnormal_pred_npy
+            abnormal_pred_npy = abnormal_pred.detach().cpu().numpy()[0][0]
+            pred_npy *= abnormal_pred_npy
 
-        label_npy = label.data.cpu().numpy()[0][0]
+        label_npy = label.detach().cpu().numpy()[0][0]
 
         preds.append(pred_npy)
         labels.append(label_npy)
 
         if train:
             if use_amp:
-                if scaler is None:
-                    raise ValueError("AMP enabled but GradScaler is None")
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
                 optimizer.step()
+
         num_batches += 1
 
-    if num_batches == 0:
-        raise RuntimeError("No batches processed. Check labels/data and abnormal filtering.")
     avg_loss = total_loss / num_batches
-    
-    fpr, tpr, threshold = metrics.roc_curve(labels, preds)
+
+    fpr, tpr, _ = metrics.roc_curve(labels, preds)
     auc = metrics.auc(fpr, tpr)
 
     if abnormal_model_path and not train:
