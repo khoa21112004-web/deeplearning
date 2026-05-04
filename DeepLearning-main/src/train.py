@@ -1,4 +1,3 @@
-import os
 import torch
 import torch.nn.functional as F
 from sklearn import metrics
@@ -33,6 +32,7 @@ def run_epoch(model, loader, optimizer=None, device="cuda"):
         total_loss += loss.item()
 
         pred = torch.sigmoid(logit).item()
+
         preds.append(pred)
         labels.append(y.item())
 
@@ -58,7 +58,7 @@ def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 
     for epoch in range(1, 6):
-        print(f"\nEpoch {epoch}")
+        print(f"\n🚀 Epoch {epoch}")
 
         train_loss, train_auc = run_epoch(model, train_loader, optimizer, device)
         val_loss, val_auc = run_epoch(model, valid_loader, None, device)
