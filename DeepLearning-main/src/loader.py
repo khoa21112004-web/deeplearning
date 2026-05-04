@@ -3,8 +3,7 @@ import os
 import torch
 import torch.nn.functional as F
 import torch.utils.data as data
-
-from torch.autograd import Variable
+import torchvision.transforms as transforms
 
 INPUT_DIM = 224
 MAX_PIXEL_VAL = 255
@@ -25,134 +24,128 @@ class Dataset(data.Dataset):
         self.use_gpu = use_gpu
 
         label_dict = {}
-        self.paths = []
         abnormal_label_dict = {}
-        
-        if datadir[-1]=="/":
-            datadir = datadir[:-1]
-        self.datadir = datadir
+        self.paths = []
 
-        label_root = labels_dir if labels_dir is not None else datadir
+        self.datadir = datadir.rstrip("/")
 
-        for i, line in enumerate(open(label_root + '-' + tear_type + '.csv').readlines()):
-            line = line.strip().split(',')
-            filename = _normalize_id(line[0])
-            label = line[1]
-            label_dict[filename] = int(label)
+        label_root = labels_dir if labels_dir else datadir
 
-        for i, line in enumerate(open(label_root + '-' + "abnormal" + '.csv').readlines()):
-            line = line.strip().split(',')
-            filename = _normalize_id(line[0])
-            label = line[1]
-            abnormal_label_dict[filename] = int(label)
+        # ===== LOAD LABEL =====
+        for line in open(label_root + '-' + tear_type + '.csv'):
+            f, l = line.strip().split(',')
+            label_dict[_normalize_id(f)] = int(l)
 
-        for filename in os.listdir(os.path.join(datadir, "axial")):
-            if filename.endswith(".npy"):
-                self.paths.append(filename)
+        for line in open(label_root + '-abnormal.csv'):
+            f, l = line.strip().split(',')
+            abnormal_label_dict[_normalize_id(f)] = int(l)
+
+        # ===== LOAD FILE =====
+        for f in os.listdir(os.path.join(self.datadir, "axial")):
+            if f.endswith(".npy"):
+                self.paths.append(f)
 
         self.paths.sort()
-        all_paths = list(self.paths)
-        filtered_paths = []
-        for path in all_paths:
-            pid = _normalize_id(path)
-            if pid in label_dict and pid in abnormal_label_dict:
-                filtered_paths.append(path)
-        self.paths = filtered_paths
-        dropped = len(all_paths) - len(self.paths)
-        if dropped > 0:
-            print(f"[Dataset] Dropped {dropped} samples without matching labels in {self.datadir}")
 
-        if not self.paths:
-            raise ValueError(
-                f"No labeled samples found in {self.datadir}. "
-                f"Check label files: {label_root + '-' + tear_type + '.csv'} and "
-                f"{label_root + '-abnormal.csv'}"
-            )
+        # ===== FILTER =====
+        self.paths = [
+            p for p in self.paths
+            if _normalize_id(p) in label_dict and _normalize_id(p) in abnormal_label_dict
+        ]
 
-        self.labels = [label_dict[_normalize_id(path)] for path in self.paths]
-        self.abnormal_labels = [abnormal_label_dict[_normalize_id(path)] for path in self.paths]
+        if len(self.paths) == 0:
+            raise ValueError("❌ Không tìm thấy data hợp lệ")
 
+        self.labels = [label_dict[_normalize_id(p)] for p in self.paths]
+        self.abnormal_labels = [abnormal_label_dict[_normalize_id(p)] for p in self.paths]
+
+        # ===== WEIGHTED LOSS =====
         if tear_type != "abnormal":
-            temp_labels = [self.labels[i] for i in range(len(self.labels)) if self.abnormal_labels[i]==1]
-            neg_weight = float(np.mean(temp_labels)) if temp_labels else 0.5
+            temp = [self.labels[i] for i in range(len(self.labels)) if self.abnormal_labels[i] == 1]
+            neg_weight = float(np.mean(temp)) if temp else 0.5
         else:
             neg_weight = float(np.mean(self.labels)) if self.labels else 0.5
-        
+
         self.weights = [neg_weight, 1 - neg_weight]
 
+        # ===== AUGMENTATION ===== 🔥
+        self.augment = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(10),
+        ])
+
     def weighted_loss(self, prediction, target):
-        weights_npy = np.array([self.weights[int(t[0])] for t in target.data])
-        weights_tensor = torch.FloatTensor(weights_npy)
+        weights = torch.FloatTensor([self.weights[int(t[0])] for t in target])
         if self.use_gpu:
-            weights_tensor = weights_tensor.cuda()
-        loss = F.binary_cross_entropy_with_logits(prediction, target, weight=Variable(weights_tensor))
-        return loss
+            weights = weights.cuda()
+        return F.binary_cross_entropy_with_logits(prediction, target, weight=weights)
+
+    def process_volume(self, vol):
+        # crop center
+        pad = int((vol.shape[2] - INPUT_DIM) / 2)
+        vol = vol[:, pad:-pad, pad:-pad]
+
+        # normalize
+        vol = (vol - np.min(vol)) / (np.max(vol) - np.min(vol) + 1e-6)
+        vol = vol * MAX_PIXEL_VAL
+        vol = (vol - MEAN) / STDDEV
+
+        # to 3 channel
+        vol = np.stack((vol,) * 3, axis=1)
+
+        # 🔥 AUGMENT từng slice
+        for i in range(vol.shape[0]):
+            img = torch.FloatTensor(vol[i])
+            vol[i] = self.augment(img).numpy()
+
+        return torch.FloatTensor(vol)
 
     def __getitem__(self, index):
         filename = self.paths[index]
+
         vol_axial = np.load(os.path.join(self.datadir, "axial", filename))
         vol_sagit = np.load(os.path.join(self.datadir, "sagittal", filename))
         vol_coron = np.load(os.path.join(self.datadir, "coronal", filename))
 
-        # axial
-        pad = int((vol_axial.shape[2] - INPUT_DIM)/2)
-        vol_axial = vol_axial[:,pad:-pad,pad:-pad]
-        vol_axial = (vol_axial-np.min(vol_axial))/(np.max(vol_axial)-np.min(vol_axial))*MAX_PIXEL_VAL
-        vol_axial = (vol_axial - MEAN) / STDDEV
-        vol_axial = np.stack((vol_axial,)*3, axis=1)
-        vol_axial_tensor = torch.FloatTensor(vol_axial)
-        
-        # sagittal
-        pad = int((vol_sagit.shape[2] - INPUT_DIM)/2)
-        vol_sagit = vol_sagit[:,pad:-pad,pad:-pad]
-        vol_sagit = (vol_sagit-np.min(vol_sagit))/(np.max(vol_sagit)-np.min(vol_sagit))*MAX_PIXEL_VAL
-        vol_sagit = (vol_sagit - MEAN) / STDDEV
-        vol_sagit = np.stack((vol_sagit,)*3, axis=1)
-        vol_sagit_tensor = torch.FloatTensor(vol_sagit)
+        vol_axial = self.process_volume(vol_axial)
+        vol_sagit = self.process_volume(vol_sagit)
+        vol_coron = self.process_volume(vol_coron)
 
-        # coronal
-        pad = int((vol_coron.shape[2] - INPUT_DIM)/2)
-        vol_coron = vol_coron[:,pad:-pad,pad:-pad]
-        vol_coron = (vol_coron-np.min(vol_coron))/(np.max(vol_coron)-np.min(vol_coron))*MAX_PIXEL_VAL
-        vol_coron = (vol_coron - MEAN) / STDDEV
-        vol_coron = np.stack((vol_coron,)*3, axis=1)
-        vol_coron_tensor = torch.FloatTensor(vol_coron)
+        label = torch.FloatTensor([self.labels[index]])
 
-        label_tensor = torch.FloatTensor([self.labels[index]])
-
-        return vol_axial_tensor, vol_sagit_tensor, vol_coron_tensor, label_tensor, self.abnormal_labels[index]
+        return vol_axial, vol_sagit, vol_coron, label, self.abnormal_labels[index]
 
     def __len__(self):
         return len(self.paths)
 
+
 def load_data(task="acl", use_gpu=False, data_dir="data", labels_dir=None, num_workers=4):
+
     train_dir = os.path.join(data_dir, "train")
     valid_dir = os.path.join(data_dir, "valid")
+
     labels_train = None if labels_dir is None else os.path.join(labels_dir, "train")
     labels_valid = None if labels_dir is None else os.path.join(labels_dir, "valid")
-    
-    train_dataset = Dataset(train_dir, task, use_gpu, labels_dir=labels_train)
-    valid_dataset = Dataset(valid_dir, task, use_gpu, labels_dir=labels_valid)
 
-    max_workers = os.cpu_count() or 1
-    workers = max(0, min(num_workers, max_workers))
-    pin_memory = bool(use_gpu)
+    train_dataset = Dataset(train_dir, task, use_gpu, labels_train)
+    valid_dataset = Dataset(valid_dir, task, use_gpu, labels_valid)
 
     train_loader = data.DataLoader(
         train_dataset,
         batch_size=1,
-        num_workers=workers,
         shuffle=True,
-        pin_memory=pin_memory,
-        persistent_workers=(workers > 0),
+        num_workers=num_workers,
+        pin_memory=use_gpu,
+        persistent_workers=(num_workers > 0),
     )
+
     valid_loader = data.DataLoader(
         valid_dataset,
         batch_size=1,
-        num_workers=workers,
         shuffle=False,
-        pin_memory=pin_memory,
-        persistent_workers=(workers > 0),
+        num_workers=num_workers,
+        pin_memory=use_gpu,
+        persistent_workers=(num_workers > 0),
     )
 
     return train_loader, valid_loader
