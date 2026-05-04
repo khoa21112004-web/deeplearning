@@ -35,7 +35,7 @@ def resize_slices(vol, target=TARGET_SLICES):
 
 # ===== PREPROCESS =====
 def preprocess(vol):
-    vol = vol.astype(np.float32)  # 🔥 FIX dtype
+    vol = vol.astype(np.float32)
 
     pad = int((vol.shape[2] - INPUT_DIM) / 2)
     vol = vol[:, pad:-pad, pad:-pad]
@@ -43,11 +43,13 @@ def preprocess(vol):
     vol = (vol - np.min(vol)) / (np.max(vol) - np.min(vol) + 1e-6) * MAX_PIXEL_VAL
     vol = (vol - MEAN) / STDDEV
 
-    vol = resize_slices(vol)
-    vol = np.stack((vol,) * 3, axis=1)
+    # 🔥 chỉ lấy 1 slice
+    mid = vol.shape[0] // 2
+    vol = vol[mid]
+
+    vol = np.stack((vol,) * 3, axis=0)
 
     return torch.FloatTensor(vol)
-
 
 class Dataset(data.Dataset):
     def __init__(self, datadir, tear_type, use_gpu, labels_dir=None, augment=False):
