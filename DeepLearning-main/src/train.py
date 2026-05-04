@@ -1,154 +1,100 @@
-import argparse
-import json
-import numpy as np
 import os
+import time
 import torch
+import torch.nn as nn
+from sklearn import metrics
 
-from datetime import datetime
-from pathlib import Path
-
-from src.evaluate import run_model
 from src.loader import load_data
 from src.model import TripleMRNet
 
 
-# ================= FOCAL LOSS =================
-class FocalLoss(torch.nn.Module):
-    def __init__(self, gamma=2):
-        super().__init__()
-        self.gamma = gamma
+def run_epoch(model, loader, optimizer=None, scaler=None, device="cpu"):
+    train = optimizer is not None
+    model.train() if train else model.eval()
 
-    def forward(self, logits, targets):
-        bce = torch.nn.functional.binary_cross_entropy_with_logits(
-            logits, targets, reduction='none'
-        )
-        pt = torch.exp(-bce)
-        return ((1 - pt) ** self.gamma * bce).mean()
+    total_loss = 0.0
+    preds, labels = [], []
+
+    for ax, sa, co, y in loader:
+        ax = ax.to(device, non_blocking=True)
+        sa = sa.to(device, non_blocking=True)
+        co = co.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        if train:
+            optimizer.zero_grad(set_to_none=True)
+
+        with torch.set_grad_enabled(train):
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    logit = model(ax, sa, co)
+                    loss = nn.functional.binary_cross_entropy_with_logits(logit, y)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logit = model(ax, sa, co)
+                loss = nn.functional.binary_cross_entropy_with_logits(logit, y)
+                if train:
+                    loss.backward()
+                    optimizer.step()
+
+        total_loss += loss.item()
+        p = torch.sigmoid(logit).detach().cpu().numpy()[0][0]
+        t = y.detach().cpu().numpy()[0][0]
+        preds.append(p)
+        labels.append(t)
+
+    avg_loss = total_loss / max(1, len(loader))
+    fpr, tpr, _ = metrics.roc_curve(labels, preds)
+    auc = metrics.auc(fpr, tpr)
+    return avg_loss, auc
 
 
 def train(
-    rundir, task, backbone, epochs, learning_rate, weight_decay, use_gpu,
-    abnormal_model_path=None, data_dir="data", labels_dir=None,
-    num_workers=4, use_amp=False
+    rundir="runs_acl",
+    task="acl",
+    epochs=10,
+    lr=3e-4,
+    weight_decay=1e-5,
+    data_dir="data",
+    labels_dir="labels",
+    num_workers=2,
+    use_amp=True
 ):
-    # ================= LOAD DATA =================
+    os.makedirs(rundir, exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     train_loader, valid_loader = load_data(
-        task, use_gpu, data_dir=data_dir, labels_dir=labels_dir, num_workers=num_workers
+        task=task, data_dir=data_dir, labels_dir=labels_dir, num_workers=num_workers
     )
 
-    # ================= MODEL =================
-    model = TripleMRNet(backbone=backbone)
+    model = TripleMRNet().to(device)
 
-    # 🔥 Freeze backbone ban đầu
-    for name, param in model.named_parameters():
-        param.requires_grad = ("classifier" in name)
-
-    if use_gpu:
-        model = model.cuda()
-
-    # ================= LOSS =================
-    criterion = FocalLoss()
-
-    # ================= OPTIMIZER (2 LR) =================
-    def make_optimizer(unfreeze=False):
-        head = [p for n, p in model.named_parameters() if "classifier" in n]
-        body = [p for n, p in model.named_parameters() if "classifier" not in n]
-
-        if not unfreeze:
-            return torch.optim.AdamW(head, lr=1e-4, weight_decay=weight_decay)
-
-        return torch.optim.AdamW([
-            {"params": head, "lr": 1e-4},
-            {"params": body, "lr": 1e-6}
-        ], weight_decay=weight_decay)
-
-    optimizer = make_optimizer(unfreeze=False)
-
-    # ================= SCHEDULER =================
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', patience=2, factor=0.3
+        optimizer, mode="min", patience=2, factor=0.3
     )
 
-    scaler = torch.amp.GradScaler("cuda", enabled=(use_gpu and use_amp))
+    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and device == "cuda"))
 
-    # ================= LOG FILE =================
-    log_path = Path(rundir) / "train_log.csv"
-    log_file = open(log_path, "w")
-    log_file.write("epoch,train_loss,train_auc,val_loss,val_auc\n")
+    best_auc = 0.0
 
-    # ================= CHECKPOINT =================
-    checkpoint_dir = Path(rundir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    for ep in range(1, epochs + 1):
+        t0 = time.time()
+        tr_loss, tr_auc = run_epoch(model, train_loader, optimizer, scaler, device)
+        va_loss, va_auc = run_epoch(model, valid_loader, None, None, device)
 
-    best_val_auc = 0
-    patience = 4
-    counter = 0
-    backbone_unfrozen = False
+        scheduler.step(va_loss)
 
-    start_time = datetime.now()
+        print(f"[Epoch {ep}] "
+              f"Train Loss: {tr_loss:.4f} | Train AUC: {tr_auc:.4f} || "
+              f"Valid Loss: {va_loss:.4f} | Valid AUC: {va_auc:.4f}")
 
-    # ================= TRAIN LOOP =================
-    for epoch in range(epochs):
-        print(f"\n🚀 Epoch {epoch+1}/{epochs} | Time: {datetime.now() - start_time}")
+        if va_auc > best_auc:
+            best_auc = va_auc
+            torch.save(model.state_dict(), os.path.join(rundir, f"best_auc_{va_auc:.4f}.pth"))
+            print("💾 Save BEST")
 
-        # 🔥 UNFREEZE SAU 4 EPOCH
-        if epoch == 4 and not backbone_unfrozen:
-            print("🔥 Unfreezing backbone...")
-            backbone_unfrozen = True
-            optimizer = make_optimizer(unfreeze=True)
-
-        # ===== TRAIN =====
-        train_loss, train_auc, _, _ = run_model(
-            model,
-            train_loader,
-            train=True,
-            optimizer=optimizer,
-            external_criterion=criterion,
-            use_amp=(use_gpu and use_amp),
-            scaler=scaler,
-            grad_clip=1.0
-        )
-
-        # ===== VALID =====
-        val_loss, val_auc, _, _ = run_model(
-            model,
-            valid_loader,
-            external_criterion=criterion,
-            use_amp=(use_gpu and use_amp)
-        )
-
-        # ===== PRINT =====
-        print(f"[Epoch {epoch+1}]")
-        print(f"Train Loss: {train_loss:.4f} | Train AUC: {train_auc:.4f}")
-        print(f"Valid Loss: {val_loss:.4f} | Valid AUC: {val_auc:.4f}")
-        print(f"LR: {optimizer.param_groups[0]['lr']:.2e}")
-
-        # ===== LOG =====
-        log_file.write(f"{epoch+1},{train_loss:.4f},{train_auc:.4f},{val_loss:.4f},{val_auc:.4f}\n")
-        log_file.flush()
-
-        # ===== SCHEDULER =====
-        scheduler.step(val_auc)
-
-        # ===== SAVE BEST =====
-        if val_auc > best_val_auc:
-            best_val_auc = val_auc
-            counter = 0
-
-            torch.save(
-                model.state_dict(),
-                checkpoint_dir / "best_model.pth"
-            )
-            print("💾 Save BEST model")
-
-        else:
-            counter += 1
-            print(f"⏳ No improve ({counter}/{patience})")
-
-        # ===== EARLY STOP =====
-        if counter >= patience:
-            print("⛔ Early stopping triggered")
-            break
-
-    log_file.close()
-    print(f"\n✅ Done. Best Val AUC: {best_val_auc:.4f}")
+    print(f"Done. Best Val AUC: {best_auc:.4f}")
