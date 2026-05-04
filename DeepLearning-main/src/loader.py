@@ -10,7 +10,6 @@ STD = 49.73
 
 
 def _normalize_id(x):
-    # 🔥 KHÔNG convert int
     return os.path.splitext(os.path.basename(str(x).strip()))[0]
 
 
@@ -32,7 +31,6 @@ def preprocess(vol):
     pad = (vol.shape[2] - INPUT_DIM) // 2
     vol = vol[:, pad:-pad, pad:-pad]
 
-    # 🔥 normalize FIXED
     vol = (vol - MEAN) / STD
 
     vol = resize_slices(vol)
@@ -42,23 +40,31 @@ def preprocess(vol):
 
 
 class Dataset(data.Dataset):
-    def __init__(self, datadir, task, labels_dir=None):
-        self.datadir = datadir.rstrip("/")
+    def __init__(self, datadir, task, labels_dir):
+        self.datadir = datadir
 
-        label_root = labels_dir if labels_dir else datadir
+        # 🔥 FIX PATH LABEL
+        label_path = os.path.join(labels_dir, f"{task}.csv")
+        abnormal_path = os.path.join(labels_dir, "abnormal.csv")
+
+        if not os.path.exists(label_path):
+            raise FileNotFoundError(f"Missing {label_path}")
+
         label_dict = {}
         abnormal_dict = {}
 
-        for line in open(label_root + f"-{task}.csv"):
-            f, l = line.strip().split(',')
-            label_dict[_normalize_id(f)] = int(l)
+        with open(label_path) as f:
+            for line in f:
+                k, v = line.strip().split(',')
+                label_dict[_normalize_id(k)] = int(v)
 
-        for line in open(label_root + "-abnormal.csv"):
-            f, l = line.strip().split(',')
-            abnormal_dict[_normalize_id(f)] = int(l)
+        with open(abnormal_path) as f:
+            for line in f:
+                k, v = line.strip().split(',')
+                abnormal_dict[_normalize_id(k)] = int(v)
 
         self.paths = []
-        for f in os.listdir(os.path.join(self.datadir, "axial")):
+        for f in os.listdir(os.path.join(datadir, "axial")):
             if f.endswith(".npy"):
                 pid = _normalize_id(f)
                 if pid in label_dict and pid in abnormal_dict:
@@ -67,8 +73,9 @@ class Dataset(data.Dataset):
         self.paths.sort()
         self.labels = [label_dict[_normalize_id(p)] for p in self.paths]
 
-        print("Loaded:", len(self.paths))
-        for i in range(3):
+        print(f"Loaded {len(self.paths)} samples from {datadir}")
+
+        for i in range(min(3, len(self.paths))):
             print(self.paths[i], self.labels[i])
 
     def __len__(self):
@@ -86,7 +93,8 @@ class Dataset(data.Dataset):
         return ax, sa, co, y
 
 
-def load_data(task="acl", data_dir="data", labels_dir=None, num_workers=2):
+def load_data(task="acl", data_dir="data", labels_dir="labels", num_workers=2):
+
     train_ds = Dataset(
         os.path.join(data_dir, "train"),
         task,
@@ -99,7 +107,12 @@ def load_data(task="acl", data_dir="data", labels_dir=None, num_workers=2):
         labels_dir=os.path.join(labels_dir, "valid")
     )
 
-    train_loader = data.DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=num_workers)
-    valid_loader = data.DataLoader(valid_ds, batch_size=1, shuffle=False, num_workers=num_workers)
+    train_loader = data.DataLoader(
+        train_ds, batch_size=1, shuffle=True, num_workers=num_workers
+    )
+
+    valid_loader = data.DataLoader(
+        valid_ds, batch_size=1, shuffle=False, num_workers=num_workers
+    )
 
     return train_loader, valid_loader
