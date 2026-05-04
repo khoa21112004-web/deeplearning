@@ -3,9 +3,8 @@ import torch
 from tqdm import tqdm
 from sklearn import metrics
 
-from loader import load_data
-from model import TripleMRNet
-
+from src.loader import load_data
+from src.model import TripleMRNet
 
 # ================= RUN MODEL =================
 def run_model(
