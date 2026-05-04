@@ -54,7 +54,7 @@ def run_model(model, loader, train=False, optimizer=None,
 
                 # ===== FIX LOSS =====
                 if external_criterion is not None:
-                    loss = external_criterion(logit, y)
+                    loss = F.binary_cross_entropy_with_logits(logit, y)
                 else:
                     loss = F.binary_cross_entropy_with_logits(logit, y)
 
