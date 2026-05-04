@@ -32,7 +32,6 @@ def run_epoch(model, loader, optimizer=None, device="cuda"):
         total_loss += loss.item()
 
         pred = torch.sigmoid(logit).item()
-
         preds.append(pred)
         labels.append(y.item())
 
@@ -50,7 +49,7 @@ def train():
     train_loader, valid_loader = load_data(
         task="acl",
         data_dir="data",
-        labels_dir="labels"
+        labels_root="labels"
     )
 
     model = TripleMRNet().to(device)
