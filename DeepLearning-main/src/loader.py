@@ -48,7 +48,7 @@ def preprocess(vol):
 
     vol = np.stack((vol,) * 3, axis=0)
 
-    return torch.from_numpy(vol).float()
+    return torch.from_numpy(vol).float().unsqueeze(0)
 
 
 class Dataset(data.Dataset):
