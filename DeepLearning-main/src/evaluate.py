@@ -18,83 +18,60 @@ def get_parser():
     return parser
 
 def run_model(model, loader, train=False, optimizer=None,
-        abnormal_model_path=None, use_amp=False, scaler=None):
+              use_amp=False, scaler=None,
+              external_criterion=None, grad_clip=None):
 
-    preds = []
-    labels = []
+    import torch
+    from sklearn import metrics
+    from tqdm import tqdm
+
+    preds, labels = [], []
     device = next(model.parameters()).device
 
-    if train:
-        model.train()
-    else:
-        if abnormal_model_path:
-            abnormal_model = TripleMRNet(backbone=model.backbone)
-            state_dict = torch.load(abnormal_model_path, map_location=device)
-            abnormal_model.load_state_dict(state_dict)
-            abnormal_model.to(device)
-            abnormal_model.eval()
-        model.eval()
-
-    total_loss = 0.
-    num_batches = 0
+    total_loss, n = 0.0, 0
 
     for batch in tqdm(loader):
-        vol_axial, vol_sagit, vol_coron, label, abnormal = batch
-        abnormal_flag = bool(abnormal.item()) if torch.is_tensor(abnormal) else bool(abnormal)
+        x1, x2, x3, y, _ = batch
+
+        x1 = x1.to(device, non_blocking=True)
+        x2 = x2.to(device, non_blocking=True)
+        x3 = x3.to(device, non_blocking=True)
+        y  = y.to(device, non_blocking=True)
 
         if train:
-            if abnormal_model_path and not abnormal_flag:
-                continue
             optimizer.zero_grad()
-
-        # ===== 🔥 FIX GPU =====
-        vol_axial = vol_axial.to(device, non_blocking=True)
-        vol_sagit = vol_sagit.to(device, non_blocking=True)
-        vol_coron = vol_coron.to(device, non_blocking=True)
-        label = label.to(device, non_blocking=True)
 
         with torch.set_grad_enabled(train):
             with torch.amp.autocast("cuda", enabled=use_amp):
-
-                logit = model(vol_axial, vol_sagit, vol_coron)
-                loss = loader.dataset.weighted_loss(logit, label)
+                logit = model(x1, x2, x3)
+                loss = external_criterion(logit, y)
 
         total_loss += loss.item()
 
-        pred = torch.sigmoid(logit)
-        pred_npy = pred.detach().cpu().numpy()[0][0]
-
-        if abnormal_model_path and not train:
-            with torch.no_grad():
-                abnormal_logit = abnormal_model(vol_axial, vol_sagit, vol_coron)
-            abnormal_pred = torch.sigmoid(abnormal_logit)
-            abnormal_pred_npy = abnormal_pred.detach().cpu().numpy()[0][0]
-            pred_npy *= abnormal_pred_npy
-
-        label_npy = label.detach().cpu().numpy()[0][0]
-
-        preds.append(pred_npy)
-        labels.append(label_npy)
+        prob = torch.sigmoid(logit).detach().cpu().numpy().ravel()
+        lab  = y.detach().cpu().numpy().ravel()
+        preds.extend(prob.tolist())
+        labels.extend(lab.tolist())
 
         if train:
             if use_amp:
                 scaler.scale(loss).backward()
+                if grad_clip:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                if grad_clip:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
 
-        num_batches += 1
+        n += 1
 
-    avg_loss = total_loss / num_batches
-
+    avg_loss = total_loss / max(n, 1)
     fpr, tpr, _ = metrics.roc_curve(labels, preds)
     auc = metrics.auc(fpr, tpr)
-
-    if abnormal_model_path and not train:
-        del abnormal_model
-
     return avg_loss, auc, preds, labels
 
 def evaluate(split, model_path, diagnosis, use_gpu, data_dir="data", labels_dir=None, num_workers=4):
