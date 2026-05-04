@@ -8,7 +8,7 @@ from loader import load_data
 from model import TripleMRNet
 
 
-# ===== ARG PARSER =====
+# ===== ARG =====
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str, required=True)
@@ -33,7 +33,7 @@ def run_model(model, loader, train=False, optimizer=None,
     else:
         model.eval()
 
-    for batch in tqdm(loader):
+    for batch in tqdm(loader, ncols=100):  # thanh progress %
         x1, x2, x3, y, _ = batch
 
         x1 = x1.to(device, non_blocking=True)
@@ -49,7 +49,10 @@ def run_model(model, loader, train=False, optimizer=None,
 
                 logit = model(x1, x2, x3)
 
-                # ===== FIX LOSS (QUAN TRỌNG) =====
+                # ===== FIX SHAPE (QUAN TRỌNG) =====
+                y = y.view_as(logit)
+
+                # ===== FIX LOSS =====
                 if external_criterion is not None:
                     loss = external_criterion(logit, y)
                 else:
