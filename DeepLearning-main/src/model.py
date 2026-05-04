@@ -3,6 +3,7 @@ import torch.nn as nn
 from torchvision import models
 
 
+# ================= SIMPLE MRNET =================
 class MRNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -11,7 +12,10 @@ class MRNet(nn.Module):
         self.classifier = nn.Linear(256, 1)
 
     def forward(self, x):
-        x = torch.squeeze(x, dim=0)  # batch size = 1
+        # chỉ squeeze nếu input có 5D
+        if x.dim() == 5:
+            x = x.squeeze(0)
+
         x = self.model.features(x)
         x = self.gap(x).view(x.size(0), -1)
         x = torch.max(x, 0, keepdim=True)[0]
@@ -20,14 +24,13 @@ class MRNet(nn.Module):
 
 
 # ================= MAIN MODEL =================
-
 class TripleMRNet(nn.Module):
     def __init__(self, backbone="efficientnet_b0", training=True):
         super().__init__()
 
         self.backbone = backbone
 
-        # ===== BUILD BACKBONE =====
+        # ===== BACKBONE =====
         if self.backbone == "resnet18":
             resnet = models.resnet18(
                 weights=models.ResNet18_Weights.DEFAULT if training else None
@@ -50,7 +53,7 @@ class TripleMRNet(nn.Module):
         else:
             raise ValueError(f"Backbone {self.backbone} not supported")
 
-        # ===== FREEZE (QUAN TRỌNG) =====
+        # ===== FREEZE =====
         for param in self.feature_extractor.parameters():
             param.requires_grad = False
 
@@ -71,6 +74,10 @@ class TripleMRNet(nn.Module):
 
     # ===== FEATURE EXTRACT =====
     def extract(self, vol):
+        # 🔥 FIX CHỐT: đảm bảo input luôn 4D
+        if vol.dim() == 3:
+            vol = vol.unsqueeze(0)  # (3,H,W) -> (1,3,H,W)
+
         vol = self.feature_extractor(vol)
         vol = self.gap(vol).view(vol.size(0), -1)
         vol = torch.max(vol, 0, keepdim=True)[0]
@@ -78,9 +85,16 @@ class TripleMRNet(nn.Module):
 
     # ===== FORWARD =====
     def forward(self, vol_axial, vol_sagit, vol_coron):
-        vol_axial = torch.squeeze(vol_axial, dim=0)
-        vol_sagit = torch.squeeze(vol_sagit, dim=0)
-        vol_coron = torch.squeeze(vol_coron, dim=0)
+
+        # 🔥 FIX CHUẨN: chỉ squeeze nếu là 5D (case cũ)
+        if vol_axial.dim() == 5:
+            vol_axial = vol_axial.squeeze(0)
+
+        if vol_sagit.dim() == 5:
+            vol_sagit = vol_sagit.squeeze(0)
+
+        if vol_coron.dim() == 5:
+            vol_coron = vol_coron.squeeze(0)
 
         x = self.extract(vol_axial)
         y = self.extract(vol_sagit)
@@ -93,7 +107,6 @@ class TripleMRNet(nn.Module):
 
 
 # ================= BACKBONE BUILDER =================
-
 def _build_efficientnet_b0(training):
     if hasattr(models, "EfficientNet_B0_Weights"):
         weights = models.EfficientNet_B0_Weights.DEFAULT if training else None
