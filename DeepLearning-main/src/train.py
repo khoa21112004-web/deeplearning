@@ -12,6 +12,20 @@ from loader import load_data
 from model import TripleMRNet
 
 
+# ================= FOCAL LOSS =================
+class FocalLoss(torch.nn.Module):
+    def __init__(self, gamma=2):
+        super().__init__()
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none'
+        )
+        pt = torch.exp(-bce)
+        return ((1 - pt) ** self.gamma * bce).mean()
+
+
 def train(
     rundir, task, backbone, epochs, learning_rate, weight_decay, use_gpu,
     abnormal_model_path=None, data_dir="data", labels_dir=None,
@@ -25,20 +39,16 @@ def train(
     # ================= MODEL =================
     model = TripleMRNet(backbone=backbone)
 
-    # 🔥 Freeze backbone nhưng mở layer cuối
-    if hasattr(model, 'features'):
-        for param in model.features.parameters():
+    # 🔥 Freeze backbone (QUAN TRỌNG)
+    for name, param in model.named_parameters():
+        if "classifier" not in name:
             param.requires_grad = False
-
-        # mở layer cuối để fine-tune
-        try:
-            for param in model.features[-1].parameters():
-                param.requires_grad = True
-        except:
-            pass
 
     if use_gpu:
         model = model.cuda()
+
+    # ================= LOSS =================
+    criterion = FocalLoss()   # 🔥 TĂNG AUC
 
     # ================= OPTIMIZER =================
     optimizer = torch.optim.AdamW(
@@ -47,12 +57,12 @@ def train(
         weight_decay=weight_decay
     )
 
-    # 🔥 Scheduler ổn định hơn
+    # ================= SCHEDULER =================
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', patience=2, factor=0.3
     )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(use_gpu and use_amp))
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_gpu and use_amp))
 
     # ================= CHECKPOINT =================
     checkpoint_dir = Path(rundir) / "checkpoints"
@@ -80,13 +90,19 @@ def train(
     for epoch in range(start_epoch, epochs):
         print(f"\n🚀 Epoch {epoch+1}/{epochs} | Time: {datetime.now() - start_time}")
 
+        # 🔥 Unfreeze sau 2 epoch
+        if epoch == 2:
+            print("🔥 Unfreezing backbone...")
+            for param in model.parameters():
+                param.requires_grad = True
+
         # ===== TRAIN =====
         train_loss, train_auc, _, _ = run_model(
             model,
             train_loader,
             train=True,
             optimizer=optimizer,
-            abnormal_model_path=abnormal_model_path,
+            external_criterion=criterion,
             use_amp=(use_gpu and use_amp),
             scaler=scaler
         )
@@ -101,17 +117,16 @@ def train(
         val_loss, val_auc, _, _ = run_model(
             model,
             valid_loader,
-            abnormal_model_path=abnormal_model_path,
+            external_criterion=criterion,
             use_amp=(use_gpu and use_amp)
         )
 
         print(f"Valid Loss: {val_loss:.4f}")
         print(f"Valid AUC: {val_auc:.4f}")
 
-        # 🔥 Log learning rate
+        # ===== LR =====
         print(f"LR: {optimizer.param_groups[0]['lr']}")
 
-        # ===== SCHEDULER =====
         scheduler.step(val_auc)
 
         # ===== SAVE BEST =====
@@ -127,7 +142,7 @@ def train(
         else:
             patience_counter += 1
 
-        # ===== SAVE CHECKPOINT =====
+        # ===== CHECKPOINT =====
         torch.save({
             "epoch": epoch + 1,
             "model": model.state_dict(),
@@ -149,12 +164,12 @@ def get_parser():
     parser.add_argument('--labels-dir', type=str, default=None)
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--gpu', action='store_true')
-    parser.add_argument('--learning_rate', default=3e-5, type=float)
+    parser.add_argument('--learning_rate', default=1e-5, type=float)  # 🔥 giảm LR
     parser.add_argument('--weight_decay', default=1e-5, type=float)
-    parser.add_argument('--epochs', default=10, type=int)
-    parser.add_argument('--backbone', default="alexnet", type=str)
+    parser.add_argument('--epochs', default=8, type=int)
+    parser.add_argument('--backbone', default="efficientnet_b0", type=str)  # 🔥 mạnh hơn
     parser.add_argument('--abnormal_model', default=None, type=str)
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--amp', action='store_true')
     return parser
 
