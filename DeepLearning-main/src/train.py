@@ -68,13 +68,12 @@ def train(
     while epoch < epochs:
         print(f"\n🚀 Epoch {epoch+1}/{epochs}")
 
-        train_loss, train_auc, _, _ = run_model(
-            model, train_loader, train=True,
-            optimizer=optimizer,
-            abnormal_model_path=abnormal_model_path,
-            use_amp=(use_gpu and use_amp),
-            scaler=scaler
-        )
+      train_loss, train_auc, _, _ = run_model(
+          model, train_loader, train=True,
+          optimizer=optimizer,
+          use_amp=(use_gpu and use_amp),
+          scaler=scaler
+)
 
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Train AUC: {train_auc:.4f}")
