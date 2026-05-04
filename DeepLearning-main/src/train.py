@@ -1,131 +1,190 @@
+import argparse
+import json
 import numpy as np
 import os
 import torch
-import torch.nn.functional as F
-import torch.utils.data as data
 
-INPUT_DIM = 224
-MAX_PIXEL_VAL = 255
-MEAN = 58.09
-STDDEV = 49.73
+from datetime import datetime
+from pathlib import Path
 
-
-def _normalize_id(raw_id):
-    base = os.path.splitext(os.path.basename(str(raw_id).strip()))[0]
-    if base.isdigit():
-        return str(int(base))
-    return base
+from evaluate import run_model
+from loader import load_data
+from model import TripleMRNet
 
 
-class Dataset(data.Dataset):
-    def __init__(self, datadir, tear_type, use_gpu, labels_dir=None):
-        super().__init__()
-        self.use_gpu = use_gpu
-        self.datadir = datadir.rstrip('/')
-
-        label_root = labels_dir if labels_dir else datadir
-
-        label_dict = {}
-        abnormal_dict = {}
-
-        # load label chính
-        for line in open(label_root + '-' + tear_type + '.csv'):
-            fid, lab = line.strip().split(',')
-            label_dict[_normalize_id(fid)] = int(lab)
-
-        # load abnormal
-        for line in open(label_root + '-abnormal.csv'):
-            fid, lab = line.strip().split(',')
-            abnormal_dict[_normalize_id(fid)] = int(lab)
-
-        self.paths = []
-        for f in os.listdir(os.path.join(datadir, "axial")):
-            if f.endswith(".npy"):
-                pid = _normalize_id(f)
-                if pid in label_dict and pid in abnormal_dict:
-                    self.paths.append(f)
-
-        self.paths.sort()
-
-        self.labels = [label_dict[_normalize_id(p)] for p in self.paths]
-        self.abnormal_labels = [abnormal_dict[_normalize_id(p)] for p in self.paths]
-
-        pos = np.mean(self.labels)
-        self.weights = [pos, 1 - pos]
-
-    def weighted_loss(self, pred, target):
-        weights = torch.FloatTensor([self.weights[int(t[0])] for t in target])
-        if self.use_gpu:
-            weights = weights.cuda()
-        return F.binary_cross_entropy_with_logits(pred, target, weight=weights)
-
-    def preprocess(self, vol):
-        vol = vol.astype(np.float32)
-
-        pad = int((vol.shape[2] - INPUT_DIM) / 2)
-        vol = vol[:, pad:-pad, pad:-pad]
-
-        vol = (vol - np.min(vol)) / (np.max(vol) - np.min(vol) + 1e-6) * MAX_PIXEL_VAL
-        vol = (vol - MEAN) / STDDEV
-
-        # 🔥 lấy slice giữa (MRNet chuẩn)
-        mid = vol.shape[0] // 2
-        vol = vol[mid]
-
-        # convert 3 channel
-        vol = np.stack((vol,) * 3, axis=0)
-
-        return torch.FloatTensor(vol)
-
-    def __getitem__(self, idx):
-        fname = self.paths[idx]
-
-        vol_axial = np.load(os.path.join(self.datadir, "axial", fname))
-        vol_sagit = np.load(os.path.join(self.datadir, "sagittal", fname))
-        vol_coron = np.load(os.path.join(self.datadir, "coronal", fname))
-
-        vol_axial = self.preprocess(vol_axial)
-        vol_sagit = self.preprocess(vol_sagit)
-        vol_coron = self.preprocess(vol_coron)
-
-        label = torch.FloatTensor([self.labels[idx]])
-
-        return vol_axial, vol_sagit, vol_coron, label, self.abnormal_labels[idx]
-
-    def __len__(self):
-        return len(self.paths)
-
-
-def load_data(task="abnormal", use_gpu=False, data_dir="data", labels_dir=None, num_workers=2):
-
-    train_ds = Dataset(
-        os.path.join(data_dir, "train"),
-        task,
-        use_gpu,
-        labels_dir=os.path.join(labels_dir, "train") if labels_dir else None
+def train(
+    rundir, task, backbone, epochs, learning_rate, weight_decay, use_gpu,
+    abnormal_model_path=None, data_dir="data", labels_dir=None,
+    num_workers=4, use_amp=False
+):
+    # ================= LOAD DATA =================
+    train_loader, valid_loader = load_data(
+        task, use_gpu, data_dir=data_dir, labels_dir=labels_dir, num_workers=num_workers
     )
 
-    valid_ds = Dataset(
-        os.path.join(data_dir, "valid"),
-        task,
-        use_gpu,
-        labels_dir=os.path.join(labels_dir, "valid") if labels_dir else None
+    # ================= MODEL =================
+    model = TripleMRNet(backbone=backbone)
+
+    # 🔥 Freeze backbone nhưng mở layer cuối
+    if hasattr(model, 'features'):
+        for param in model.features.parameters():
+            param.requires_grad = False
+
+        # mở layer cuối để fine-tune
+        try:
+            for param in model.features[-1].parameters():
+                param.requires_grad = True
+        except:
+            pass
+
+    if use_gpu:
+        model = model.cuda()
+
+    # ================= OPTIMIZER =================
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=learning_rate,
+        weight_decay=weight_decay
     )
 
-    train_loader = data.DataLoader(
-        train_ds,
-        batch_size=1,   # 🔥 giữ nguyên như code cũ
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True
+    # 🔥 Scheduler ổn định hơn
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', patience=2, factor=0.3
     )
 
-    valid_loader = data.DataLoader(
-        valid_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
+    scaler = torch.cuda.amp.GradScaler(enabled=(use_gpu and use_amp))
 
-    return train_loader, valid_loader
+    # ================= CHECKPOINT =================
+    checkpoint_dir = Path(rundir) / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    start_epoch = 0
+    best_val_auc = 0
+
+    latest_ckpt = checkpoint_dir / "last_checkpoint.pth"
+    if latest_ckpt.exists():
+        print("🔄 Resume training from checkpoint...")
+        ckpt = torch.load(latest_ckpt)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt["epoch"]
+        best_val_auc = ckpt["best_val_auc"]
+
+    # ================= EARLY STOP =================
+    patience = 3
+    patience_counter = 0
+
+    start_time = datetime.now()
+
+    # ================= TRAIN LOOP =================
+    for epoch in range(start_epoch, epochs):
+        print(f"\n🚀 Epoch {epoch+1}/{epochs} | Time: {datetime.now() - start_time}")
+
+        # ===== TRAIN =====
+        train_loss, train_auc, _, _ = run_model(
+            model,
+            train_loader,
+            train=True,
+            optimizer=optimizer,
+            abnormal_model_path=abnormal_model_path,
+            use_amp=(use_gpu and use_amp),
+            scaler=scaler
+        )
+
+        print(f"Train Loss: {train_loss:.4f}")
+        print(f"Train AUC: {train_auc:.4f}")
+
+        if use_gpu:
+            torch.cuda.empty_cache()
+
+        # ===== VALID =====
+        val_loss, val_auc, _, _ = run_model(
+            model,
+            valid_loader,
+            abnormal_model_path=abnormal_model_path,
+            use_amp=(use_gpu and use_amp)
+        )
+
+        print(f"Valid Loss: {val_loss:.4f}")
+        print(f"Valid AUC: {val_auc:.4f}")
+
+        # 🔥 Log learning rate
+        print(f"LR: {optimizer.param_groups[0]['lr']}")
+
+        # ===== SCHEDULER =====
+        scheduler.step(val_auc)
+
+        # ===== SAVE BEST =====
+        if val_auc > best_val_auc:
+            print("💾 Save BEST model")
+            best_val_auc = val_auc
+            patience_counter = 0
+
+            torch.save(
+                model.state_dict(),
+                Path(rundir) / "best_model.pth"
+            )
+        else:
+            patience_counter += 1
+
+        # ===== SAVE CHECKPOINT =====
+        torch.save({
+            "epoch": epoch + 1,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "best_val_auc": best_val_auc,
+        }, latest_ckpt)
+
+        # ===== EARLY STOP =====
+        if patience_counter >= patience:
+            print("⛔ Early stopping triggered")
+            break
+
+
+def get_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--rundir', type=str, required=True)
+    parser.add_argument('--task', type=str, required=True)
+    parser.add_argument('--data-dir', type=str, default="data")
+    parser.add_argument('--labels-dir', type=str, default=None)
+    parser.add_argument('--seed', default=42, type=int)
+    parser.add_argument('--gpu', action='store_true')
+    parser.add_argument('--learning_rate', default=3e-5, type=float)
+    parser.add_argument('--weight_decay', default=1e-5, type=float)
+    parser.add_argument('--epochs', default=10, type=int)
+    parser.add_argument('--backbone', default="alexnet", type=str)
+    parser.add_argument('--abnormal_model', default=None, type=str)
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--amp', action='store_true')
+    return parser
+
+
+if __name__ == '__main__':
+    args = get_parser().parse_args()
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    if args.gpu:
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.benchmark = True
+
+    os.makedirs(args.rundir, exist_ok=True)
+
+    with open(Path(args.rundir) / 'args.json', 'w') as f:
+        json.dump(vars(args), f, indent=4)
+
+    train(
+        rundir=args.rundir,
+        task=args.task,
+        backbone=args.backbone,
+        epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        use_gpu=args.gpu,
+        abnormal_model_path=args.abnormal_model,
+        data_dir=args.data_dir,
+        labels_dir=args.labels_dir,
+        num_workers=args.num_workers,
+        use_amp=args.amp,
+    )
