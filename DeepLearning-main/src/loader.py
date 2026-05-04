@@ -16,7 +16,8 @@ def _normalize_id(raw_id):
 
 
 # ===== FIX SLICE (IMPROVED) =====
-def resize_slices(vol, target=TARGET_SLICES):
+
+def resize_slices(vol, target=32):
     current = vol.shape[0]
 
     if current > target:
@@ -31,30 +32,24 @@ def resize_slices(vol, target=TARGET_SLICES):
     return vol
 
 
-# ===== PREPROCESS =====
 def preprocess(vol, augment=False):
     vol = vol.astype(np.float32)
 
-    # crop center
-    pad = int((vol.shape[2] - INPUT_DIM) / 2)
+    pad = int((vol.shape[2] - 224) / 2)
     vol = vol[:, pad:-pad, pad:-pad]
 
-    # normalize
     vol = (vol - np.min(vol)) / (np.max(vol) - np.min(vol) + 1e-6)
-    vol = vol * MAX_PIXEL_VAL
-    vol = (vol - MEAN) / STDDEV
+    vol = vol * 255
+    vol = (vol - 58.09) / 49.73
 
-    # fix slice
-    vol = resize_slices(vol, TARGET_SLICES)
+    vol = resize_slices(vol)
 
-    # 🔥 AUGMENT (SAFE)
+    # 🔥 augment nhẹ thôi
     if augment:
         if np.random.rand() < 0.5:
-            vol = vol[:, :, ::-1]  # flip only
+            vol = vol[:, :, ::-1]
 
-    # to 3 channel
     vol = np.stack((vol,) * 3, axis=1)
-
     return torch.FloatTensor(vol)
 
 
