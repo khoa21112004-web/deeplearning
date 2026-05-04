@@ -11,150 +11,97 @@ from evaluate import run_model
 from loader import load_data
 from model import TripleMRNet
 
-
-# ================= FOCAL LOSS =================
-class FocalLoss(torch.nn.Module):
-    def __init__(self, gamma=2):
-        super().__init__()
-        self.gamma = gamma
-
-    def forward(self, logits, targets):
-        bce = torch.nn.functional.binary_cross_entropy_with_logits(
-            logits, targets, reduction='none'
-        )
-        pt = torch.exp(-bce)
-        return ((1 - pt) ** self.gamma * bce).mean()
-
-
 def train(
     rundir, task, backbone, epochs, learning_rate, weight_decay, use_gpu,
     abnormal_model_path=None, data_dir="data", labels_dir=None,
-    num_workers=4, use_amp=False
+    num_workers=4, use_amp=False, checkpoint_every=1
 ):
-    # ================= LOAD DATA =================
     train_loader, valid_loader = load_data(
         task, use_gpu, data_dir=data_dir, labels_dir=labels_dir, num_workers=num_workers
     )
-
-    # ================= MODEL =================
+    
     model = TripleMRNet(backbone=backbone)
+    max_epoch = 0
+    model_path = None
+    for dirpath, _, files in os.walk(rundir):
+        if not files:
+            continue
+        for fname in files:
+            if fname.endswith(".json") or "checkpoint" in fname:
+                continue
+            if "epoch" not in fname:
+                continue
+            try:
+                ep = int(fname.rsplit("epoch", 1)[1])
+            except Exception:
+                continue
+            if ep >= max_epoch:
+                max_epoch = ep
+                model_path = os.path.join(dirpath, fname)
 
-    # 🔥 Freeze backbone (QUAN TRỌNG)
-    for name, param in model.named_parameters():
-        if "classifier" not in name:
-            param.requires_grad = False
+    if model_path:
+        state_dict = torch.load(model_path, map_location=(None if use_gpu else 'cpu'))
+        model.load_state_dict(state_dict)
 
     if use_gpu:
         model = model.cuda()
 
-    # ================= LOSS =================
-    criterion = FocalLoss()   # 🔥 TĂNG AUC
+    if abnormal_model_path and not os.path.isfile(abnormal_model_path):
+        raise FileNotFoundError(f"abnormal_model_path not found: {abnormal_model_path}")
 
-    # ================= OPTIMIZER =================
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=learning_rate,
-        weight_decay=weight_decay
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), learning_rate, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=.3, threshold=1e-4)
+    scaler = torch.cuda.amp.GradScaler(enabled=(use_gpu and use_amp))
 
-    # ================= SCHEDULER =================
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', patience=2, factor=0.3
-    )
-
-    scaler = torch.amp.GradScaler("cuda", enabled=(use_gpu and use_amp))
-
-    # ================= CHECKPOINT =================
+    best_val_loss = float('inf')
     checkpoint_dir = Path(rundir) / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    start_epoch = 0
-    best_val_auc = 0
-
-    latest_ckpt = checkpoint_dir / "last_checkpoint.pth"
-    if latest_ckpt.exists():
-        print("🔄 Resume training from checkpoint...")
-        ckpt = torch.load(latest_ckpt)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch = ckpt["epoch"]
-        best_val_auc = ckpt["best_val_auc"]
-
-    # ================= EARLY STOP =================
-    patience = 3
-    patience_counter = 0
-
     start_time = datetime.now()
 
-    # ================= TRAIN LOOP =================
-    for epoch in range(start_epoch, epochs):
-        print(f"\n🚀 Epoch {epoch+1}/{epochs} | Time: {datetime.now() - start_time}")
-
-        # 🔥 Unfreeze sau 2 epoch
-        if epoch == 2:
-            print("🔥 Unfreezing backbone...")
-            for param in model.parameters():
-                param.requires_grad = True
-
-        # ===== TRAIN =====
+    epoch = 0
+    if max_epoch:
+        epoch += max_epoch
+    while epoch < epochs:
+        change = datetime.now() - start_time
+        print('starting epoch {}. time passed: {}'.format(epoch+1, str(change)))
+        
         train_loss, train_auc, _, _ = run_model(
-            model,
-            train_loader,
-            train=True,
-            optimizer=optimizer,
-            external_criterion=criterion,
-            use_amp=(use_gpu and use_amp),
-            scaler=scaler
-        )
+                model, train_loader, train=True, optimizer=optimizer,
+                abnormal_model_path=abnormal_model_path, use_amp=(use_gpu and use_amp), scaler=scaler)
 
-        print(f"Train Loss: {train_loss:.4f}")
-        print(f"Train AUC: {train_auc:.4f}")
-
+        print(f'train loss: {train_loss:0.4f}')
+        print(f'train AUC: {train_auc:0.4f}')
         if use_gpu:
             torch.cuda.empty_cache()
 
-        # ===== VALID =====
-        val_loss, val_auc, _, _ = run_model(
-            model,
-            valid_loader,
-            external_criterion=criterion,
-            use_amp=(use_gpu and use_amp)
-        )
+        val_loss, val_auc, _, _ = run_model(model, valid_loader,
+                abnormal_model_path=abnormal_model_path, use_amp=(use_gpu and use_amp))
+        
+        print(f'valid loss: {val_loss:0.4f}')
+        print(f'valid AUC: {val_auc:0.4f}')
 
-        print(f"Valid Loss: {val_loss:.4f}")
-        print(f"Valid AUC: {val_auc:.4f}")
+        scheduler.step(val_loss)
 
-        # ===== LR =====
-        print(f"LR: {optimizer.param_groups[0]['lr']}")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
 
-        scheduler.step(val_auc)
+            file_name = f'val{val_loss:0.4f}_train{train_loss:0.4f}_epoch{epoch+1}'
+            save_path = Path(rundir) / file_name
+            torch.save(model.state_dict(), save_path)
 
-        # ===== SAVE BEST =====
-        if val_auc > best_val_auc:
-            print("💾 Save BEST model")
-            best_val_auc = val_auc
-            patience_counter = 0
+        if checkpoint_every > 0 and (epoch + 1) % checkpoint_every == 0:
+            ckpt_save = checkpoint_dir / f"checkpoint_epoch{epoch+1}.pth"
+            torch.save({
+                "epoch": epoch + 1,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scaler_state": scaler.state_dict(),
+                "val_loss": val_loss,
+                "val_auc": val_auc,
+            }, ckpt_save)
 
-            torch.save(
-                model.state_dict(),
-                Path(rundir) / "best_model.pth"
-            )
-        else:
-            patience_counter += 1
-
-        # ===== CHECKPOINT =====
-        torch.save({
-            "epoch": epoch + 1,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "best_val_auc": best_val_auc,
-        }, latest_ckpt)
-
-        # ===== EARLY STOP =====
-        if patience_counter >= patience:
-            print("⛔ Early stopping triggered")
-            break
-
+        epoch += 1
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -164,30 +111,35 @@ def get_parser():
     parser.add_argument('--labels-dir', type=str, default=None)
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--gpu', action='store_true')
-    parser.add_argument('--learning_rate', default=1e-5, type=float)  # 🔥 giảm LR
-    parser.add_argument('--weight_decay', default=1e-5, type=float)
-    parser.add_argument('--epochs', default=8, type=int)
-    parser.add_argument('--backbone', default="efficientnet_b0", type=str)  # 🔥 mạnh hơn
+    parser.add_argument('--learning_rate', default=1e-05, type=float)
+    parser.add_argument('--weight_decay', default=0.01, type=float)
+    parser.add_argument('--epochs', default=50, type=int)
+    parser.add_argument('--max_patience', default=5, type=int)
+    parser.add_argument('--factor', default=0.3, type=float)
+    parser.add_argument('--backbone', default="alexnet", type=str)
     parser.add_argument('--abnormal_model', default=None, type=str)
-    parser.add_argument('--num_workers', type=int, default=2)
+    parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--amp', action='store_true')
+    parser.add_argument('--checkpoint_every', type=int, default=1)
     return parser
-
 
 if __name__ == '__main__':
     args = get_parser().parse_args()
-
+    
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-
     if args.gpu:
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.benchmark = True
 
-    os.makedirs(args.rundir, exist_ok=True)
+    if args.task != "abnormal":
+        if args.abnormal_model is None:
+            raise ValueError("Enter abnormal model path for `acl` or `meniscus` task")
 
-    with open(Path(args.rundir) / 'args.json', 'w') as f:
-        json.dump(vars(args), f, indent=4)
+    os.makedirs(args.rundir, exist_ok=True)
+    
+    with open(Path(args.rundir) / 'args.json', 'w') as out:
+        json.dump(vars(args), out, indent=4)
 
     train(
         rundir=args.rundir,
@@ -202,4 +154,5 @@ if __name__ == '__main__':
         labels_dir=args.labels_dir,
         num_workers=args.num_workers,
         use_amp=args.amp,
+        checkpoint_every=args.checkpoint_every,
     )
