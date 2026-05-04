@@ -17,66 +17,59 @@ def train(
     abnormal_model_path=None, data_dir="data", labels_dir=None,
     num_workers=4, use_amp=False, checkpoint_every=1
 ):
-    # ================= LOAD DATA =================
     train_loader, valid_loader = load_data(
         task, use_gpu, data_dir=data_dir, labels_dir=labels_dir, num_workers=num_workers
     )
 
-    # ================= MODEL =================
     model = TripleMRNet(backbone=backbone)
 
-    # 🔥 Freeze backbone để giảm overfit + tăng tốc
-    if hasattr(model, 'features'):
-        for param in model.features.parameters():
-            param.requires_grad = False
+    # ===== LOAD CHECKPOINT (FIX PYTORCH 2.6) =====
+    max_epoch = 0
+    model_path = None
+    for dirpath, _, files in os.walk(rundir):
+        for fname in files:
+            if "epoch" in fname:
+                try:
+                    ep = int(fname.rsplit("epoch", 1)[1])
+                    if ep > max_epoch:
+                        max_epoch = ep
+                        model_path = os.path.join(dirpath, fname)
+                except:
+                    continue
+
+    if model_path:
+        print("🔁 Resume training from checkpoint:", model_path)
+        state_dict = torch.load(model_path, weights_only=False)
+        model.load_state_dict(state_dict)
 
     if use_gpu:
         model = model.cuda()
 
-    # ================= RESUME =================
-    checkpoint_dir = Path(rundir) / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-    start_epoch = 0
-    best_val_auc = 0
-
-    latest_ckpt = checkpoint_dir / "last_checkpoint.pth"
-    if latest_ckpt.exists():
-        print("🔄 Resume training from checkpoint...")
-        ckpt = torch.load(latest_ckpt, weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        start_epoch = ckpt["epoch"]
-        best_val_auc = ckpt["best_val_auc"]
-
-    # ================= OPTIMIZER =================
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=learning_rate,
-        weight_decay=weight_decay
-    )
-
-    # 🔥 Scheduler theo AUC (quan trọng)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', patience=1, factor=0.3
+        optimizer, patience=3, factor=0.3
     )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(use_gpu and use_amp))
+    scaler = torch.amp.GradScaler('cuda', enabled=(use_gpu and use_amp))
 
-    # ================= EARLY STOP =================
-    patience = 2
-    patience_counter = 0
+    # ===== EARLY STOPPING =====
+    best_val_auc = 0.0
+    patience = 5
+    counter = 0
+
+    checkpoint_dir = Path(rundir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     start_time = datetime.now()
 
-    # ================= TRAIN LOOP =================
-    for epoch in range(start_epoch, epochs):
-        print(f"\n🚀 Epoch {epoch+1}/{epochs} | Time: {datetime.now() - start_time}")
+    epoch = max_epoch
 
-        # ===== TRAIN =====
+    while epoch < epochs:
+        print(f"\n🚀 Epoch {epoch+1}/{epochs}")
+
         train_loss, train_auc, _, _ = run_model(
-            model,
-            train_loader,
-            train=True,
+            model, train_loader, train=True,
             optimizer=optimizer,
             abnormal_model_path=abnormal_model_path,
             use_amp=(use_gpu and use_amp),
@@ -86,13 +79,8 @@ def train(
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Train AUC: {train_auc:.4f}")
 
-        if use_gpu:
-            torch.cuda.empty_cache()
-
-        # ===== VALID =====
         val_loss, val_auc, _, _ = run_model(
-            model,
-            valid_loader,
+            model, valid_loader,
             abnormal_model_path=abnormal_model_path,
             use_amp=(use_gpu and use_amp)
         )
@@ -100,34 +88,27 @@ def train(
         print(f"Valid Loss: {val_loss:.4f}")
         print(f"Valid AUC: {val_auc:.4f}")
 
-        # ===== SCHEDULER =====
-        scheduler.step(val_auc)
+        scheduler.step(val_loss)
 
         # ===== SAVE BEST =====
         if val_auc > best_val_auc:
-            print("💾 Save BEST model")
             best_val_auc = val_auc
-            patience_counter = 0
+            counter = 0
 
-            torch.save(
-                model.state_dict(),
-                Path(rundir) / "best_model.pth"
-            )
+            save_path = checkpoint_dir / f"best_epoch{epoch+1}_auc{val_auc:.4f}.pth"
+            torch.save(model.state_dict(), save_path)
+            print("💾 Save BEST model")
+
         else:
-            patience_counter += 1
-
-        # ===== CHECKPOINT =====
-        torch.save({
-            "epoch": epoch + 1,
-            "model": model.state_dict(),
-            "best_val_auc": best_val_auc,
-            "optimizer": optimizer.state_dict(),
-        }, latest_ckpt)
+            counter += 1
+            print(f"⚠ No improvement ({counter}/{patience})")
 
         # ===== EARLY STOP =====
-        if patience_counter >= patience:
-            print("⛔ Early stopping triggered")
+        if counter >= patience:
+            print("🛑 Early stopping triggered")
             break
+
+        epoch += 1
 
 
 def get_parser():
@@ -138,12 +119,12 @@ def get_parser():
     parser.add_argument('--labels-dir', type=str, default=None)
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--gpu', action='store_true')
-    parser.add_argument('--learning_rate', default=3e-5, type=float)
+    parser.add_argument('--learning_rate', default=1e-4, type=float)
     parser.add_argument('--weight_decay', default=1e-5, type=float)
-    parser.add_argument('--epochs', default=10, type=int)
-    parser.add_argument('--backbone', default="alexnet", type=str)
+    parser.add_argument('--epochs', default=30, type=int)
+    parser.add_argument('--backbone', default="efficientnet_b0", type=str)
     parser.add_argument('--abnormal_model', default=None, type=str)
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--amp', action='store_true')
     return parser
 
@@ -160,8 +141,8 @@ if __name__ == '__main__':
 
     os.makedirs(args.rundir, exist_ok=True)
 
-    with open(Path(args.rundir) / 'args.json', 'w') as f:
-        json.dump(vars(args), f, indent=4)
+    with open(Path(args.rundir) / 'args.json', 'w') as out:
+        json.dump(vars(args), out, indent=4)
 
     train(
         rundir=args.rundir,
