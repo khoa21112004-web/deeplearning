@@ -12,10 +12,24 @@ from loader import load_data
 from model import TripleMRNet
 
 
+# ================= FOCAL LOSS =================
+class FocalLoss(torch.nn.Module):
+    def __init__(self, gamma=2):
+        super().__init__()
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none'
+        )
+        pt = torch.exp(-bce)
+        return ((1 - pt) ** self.gamma * bce).mean()
+
+
 def train(
     rundir, task, backbone, epochs, learning_rate, weight_decay, use_gpu,
     abnormal_model_path=None, data_dir="data", labels_dir=None,
-    num_workers=4, use_amp=False, checkpoint_every=1
+    num_workers=4, use_amp=False
 ):
     # ================= LOAD DATA =================
     train_loader, valid_loader = load_data(
@@ -25,52 +39,63 @@ def train(
     # ================= MODEL =================
     model = TripleMRNet(backbone=backbone)
 
-    # 🔥 Freeze backbone để giảm overfit + tăng tốc
-    if hasattr(model, 'features'):
-        for param in model.features.parameters():
-            param.requires_grad = False
+    # 🔥 Freeze backbone ban đầu
+    for name, param in model.named_parameters():
+        param.requires_grad = ("classifier" in name)
 
     if use_gpu:
         model = model.cuda()
 
-    # ================= RESUME =================
-    checkpoint_dir = Path(rundir) / "checkpoints"
+    # ================= LOSS =================
+    criterion = FocalLoss()
+
+    # ================= OPTIMIZER (2 LR) =================
+    def make_optimizer(unfreeze=False):
+        head = [p for n, p in model.named_parameters() if "classifier" in n]
+        body = [p for n, p in model.named_parameters() if "classifier" not in n]
+
+        if not unfreeze:
+            return torch.optim.AdamW(head, lr=1e-4, weight_decay=weight_decay)
+
+        return torch.optim.AdamW([
+            {"params": head, "lr": 1e-4},
+            {"params": body, "lr": 1e-6}
+        ], weight_decay=weight_decay)
+
+    optimizer = make_optimizer(unfreeze=False)
+
+    # ================= SCHEDULER =================
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', patience=2, factor=0.3
+    )
+
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_gpu and use_amp))
+
+    # ================= LOG FILE =================
+    log_path = Path(rundir) / "train_log.csv"
+    log_file = open(log_path, "w")
+    log_file.write("epoch,train_loss,train_auc,val_loss,val_auc\n")
+
+    # ================= CHECKPOINT =================
+    checkpoint_dir = Path(rundir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    start_epoch = 0
     best_val_auc = 0
-
-    latest_ckpt = checkpoint_dir / "last_checkpoint.pth"
-    if latest_ckpt.exists():
-        print("🔄 Resume training from checkpoint...")
-        ckpt = torch.load(latest_ckpt, weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        start_epoch = ckpt["epoch"]
-        best_val_auc = ckpt["best_val_auc"]
-
-    # ================= OPTIMIZER =================
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=learning_rate,
-        weight_decay=weight_decay
-    )
-
-    # 🔥 Scheduler theo AUC (quan trọng)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', patience=1, factor=0.3
-    )
-
-    scaler = torch.cuda.amp.GradScaler(enabled=(use_gpu and use_amp))
-
-    # ================= EARLY STOP =================
-    patience = 2
-    patience_counter = 0
+    patience = 4
+    counter = 0
+    backbone_unfrozen = False
 
     start_time = datetime.now()
 
     # ================= TRAIN LOOP =================
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(epochs):
         print(f"\n🚀 Epoch {epoch+1}/{epochs} | Time: {datetime.now() - start_time}")
+
+        # 🔥 UNFREEZE SAU 4 EPOCH
+        if epoch == 4 and not backbone_unfrozen:
+            print("🔥 Unfreezing backbone...")
+            backbone_unfrozen = True
+            optimizer = make_optimizer(unfreeze=True)
 
         # ===== TRAIN =====
         train_loss, train_auc, _, _ = run_model(
@@ -78,102 +103,52 @@ def train(
             train_loader,
             train=True,
             optimizer=optimizer,
-            abnormal_model_path=abnormal_model_path,
+            external_criterion=criterion,
             use_amp=(use_gpu and use_amp),
-            scaler=scaler
+            scaler=scaler,
+            grad_clip=1.0
         )
-
-        print(f"Train Loss: {train_loss:.4f}")
-        print(f"Train AUC: {train_auc:.4f}")
-
-        if use_gpu:
-            torch.cuda.empty_cache()
 
         # ===== VALID =====
         val_loss, val_auc, _, _ = run_model(
             model,
             valid_loader,
-            abnormal_model_path=abnormal_model_path,
+            external_criterion=criterion,
             use_amp=(use_gpu and use_amp)
         )
 
-        print(f"Valid Loss: {val_loss:.4f}")
-        print(f"Valid AUC: {val_auc:.4f}")
+        # ===== PRINT =====
+        print(f"[Epoch {epoch+1}]")
+        print(f"Train Loss: {train_loss:.4f} | Train AUC: {train_auc:.4f}")
+        print(f"Valid Loss: {val_loss:.4f} | Valid AUC: {val_auc:.4f}")
+        print(f"LR: {optimizer.param_groups[0]['lr']:.2e}")
+
+        # ===== LOG =====
+        log_file.write(f"{epoch+1},{train_loss:.4f},{train_auc:.4f},{val_loss:.4f},{val_auc:.4f}\n")
+        log_file.flush()
 
         # ===== SCHEDULER =====
         scheduler.step(val_auc)
 
         # ===== SAVE BEST =====
         if val_auc > best_val_auc:
-            print("💾 Save BEST model")
             best_val_auc = val_auc
-            patience_counter = 0
+            counter = 0
 
             torch.save(
                 model.state_dict(),
-                Path(rundir) / "best_model.pth"
+                checkpoint_dir / "best_model.pth"
             )
-        else:
-            patience_counter += 1
+            print("💾 Save BEST model")
 
-        # ===== CHECKPOINT =====
-        torch.save({
-            "epoch": epoch + 1,
-            "model": model.state_dict(),
-            "best_val_auc": best_val_auc,
-            "optimizer": optimizer.state_dict(),
-        }, latest_ckpt)
+        else:
+            counter += 1
+            print(f"⏳ No improve ({counter}/{patience})")
 
         # ===== EARLY STOP =====
-        if patience_counter >= patience:
+        if counter >= patience:
             print("⛔ Early stopping triggered")
             break
 
-
-def get_parser():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--rundir', type=str, required=True)
-    parser.add_argument('--task', type=str, required=True)
-    parser.add_argument('--data-dir', type=str, default="data")
-    parser.add_argument('--labels-dir', type=str, default=None)
-    parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--gpu', action='store_true')
-    parser.add_argument('--learning_rate', default=3e-5, type=float)
-    parser.add_argument('--weight_decay', default=1e-5, type=float)
-    parser.add_argument('--epochs', default=10, type=int)
-    parser.add_argument('--backbone', default="alexnet", type=str)
-    parser.add_argument('--abnormal_model', default=None, type=str)
-    parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--amp', action='store_true')
-    return parser
-
-
-if __name__ == '__main__':
-    args = get_parser().parse_args()
-
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-
-    if args.gpu:
-        torch.cuda.manual_seed_all(args.seed)
-        torch.backends.cudnn.benchmark = True
-
-    os.makedirs(args.rundir, exist_ok=True)
-
-    with open(Path(args.rundir) / 'args.json', 'w') as f:
-        json.dump(vars(args), f, indent=4)
-
-    train(
-        rundir=args.rundir,
-        task=args.task,
-        backbone=args.backbone,
-        epochs=args.epochs,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        use_gpu=args.gpu,
-        abnormal_model_path=args.abnormal_model,
-        data_dir=args.data_dir,
-        labels_dir=args.labels_dir,
-        num_workers=args.num_workers,
-        use_amp=args.amp,
-    )
+    log_file.close()
+    print(f"\n✅ Done. Best Val AUC: {best_val_auc:.4f}")
